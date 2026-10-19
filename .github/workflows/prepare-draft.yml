@@ -1,0 +1,85 @@
+name: Prepare verified release draft
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      release_id:
+        required: true
+        type: string
+      zip_sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  stage-draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify CI archive and upload assets to existing draft
+        env:
+          ARTIFACT_URL: ${{ secrets.HAOSHI_DRAFT_ARTIFACT_URL }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          ZIP_SHA256: ${{ inputs.zip_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, re, tempfile, urllib.parse, urllib.request, zipfile, zlib
+          version=os.environ['VERSION']; release_id=os.environ['RELEASE_ID']; url=os.environ['ARTIFACT_URL']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          assert release_id.isdigit()
+          assert urllib.parse.urlparse(url).scheme=='https'
+          assert urllib.parse.urlparse(url).hostname.endswith('.blob.core.windows.net')
+          repo='wjmlong/haoshi-releases'
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          def api(path):
+              with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/'+repo+path,headers=headers)) as response: return json.load(response)
+          release=api('/releases/'+release_id)
+          assert release['draft'] and release['tag_name']=='v'+version, 'Only a matching existing draft may receive assets'
+          expected={f'haoshi-{version}-win-x64.exe',f'haoshi-{version}-win-x64.exe.blockmap','latest.yml'}
+          with tempfile.TemporaryDirectory() as root:
+              root=pathlib.Path(root); archive=root/'package.zip'
+              with urllib.request.urlopen(url,timeout=120) as response, archive.open('wb') as output:
+                  while chunk:=response.read(1024*1024): output.write(chunk)
+              assert hashlib.sha256(archive.read_bytes()).hexdigest()==os.environ['ZIP_SHA256'], 'CI artifact SHA256 mismatch'
+              with zipfile.ZipFile(archive) as package:
+                  assert package.testzip() is None, 'ZIP CRC mismatch'
+                  assert set(package.namelist())==expected, package.namelist()
+                  for name in expected: (root/name).write_bytes(package.read(name))
+              exe=root/f'haoshi-{version}-win-x64.exe'; data=exe.read_bytes(); assert data[:2]==b'MZ'
+              metadata=(root/'latest.yml').read_text()
+              assert re.search(r'^version:\s*[\"\']?'+re.escape(version)+r'[\"\']?\s*$',metadata,re.M)
+              assert base64.b64encode(hashlib.sha512(data).digest()).decode() in metadata
+              assert str(len(data)) in metadata and exe.name in metadata
+              block=(root/(exe.name+'.blockmap')).read_bytes()
+              try: mapping=json.loads(gzip.decompress(block))
+              except gzip.BadGzipFile: mapping=json.loads(zlib.decompress(block,wbits=-15))
+              assert mapping.get('files') and mapping.get('version')
+              records=[]
+              existing={asset['name']:asset for asset in release['assets']}
+              for name in sorted(expected):
+                  source=root/name; digest='sha256:'+hashlib.sha256(source.read_bytes()).hexdigest()
+                  if name in existing:
+                      asset=existing[name]
+                      assert asset['size']==source.stat().st_size and asset.get('digest')==digest, 'Existing asset differs'
+                  else:
+                      # The repository-scoped workflow token is sent only to GitHub uploads.
+                      upload='https://uploads.github.com/repos/'+repo+'/releases/'+release_id+'/assets?'+urllib.parse.urlencode({'name':name})
+                      with source.open('rb') as body:
+                          request=urllib.request.Request(upload,data=body,headers={**headers,'Content-Type':'application/octet-stream','Content-Length':str(source.stat().st_size)},method='POST')
+                          with urllib.request.urlopen(request,timeout=300) as response: asset=json.load(response)
+                      assert asset['state']=='uploaded' and asset['size']==source.stat().st_size
+                      assert asset.get('digest') in (None,digest)
+                  records.append({'name':name,'id':asset['id'],'bytes':asset['size'],'sha256':digest})
+              report={'version':version,'draft':True,'zip_sha256':os.environ['ZIP_SHA256'],'crc':'passed','updater_sha512':'passed','blockmap':'passed','assets':records}
+              pathlib.Path('release-verification.json').write_text(json.dumps(report,indent=2)+'\n')
+              print(json.dumps(report,indent=2))
+          assert api('/releases/'+release_id)['draft'], 'Release must remain a draft'
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-verification
+          path: release-verification.json
