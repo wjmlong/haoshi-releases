@@ -38,7 +38,7 @@ jobs:
           def api(path):
               with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/'+repo+path,headers=headers)) as response: return json.load(response)
           release=api('/releases/'+release_id)
-          assert release['draft'] and release['tag_name']=='v'+version, 'Only a matching existing draft may receive assets'
+          assert release['draft'] and release['name']=='好事 '+version and (release['tag_name']=='v'+version or release['tag_name'].startswith('untagged-')), 'Only a matching existing draft may receive assets'
           expected={f'haoshi-{version}-win-x64.exe',f'haoshi-{version}-win-x64.exe.blockmap','latest.yml'}
           with tempfile.TemporaryDirectory() as root:
               root=pathlib.Path(root); archive=root/'package.zip'
